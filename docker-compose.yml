@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app:ro
+      - ./data:/var/data/viralix
+    environment:
+      - FFMPEG_PATH=/usr/bin/ffmpeg
+      - VIRALIX_DATA_DIR=/var/data/viralix
+    restart: unless-stopped

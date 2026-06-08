@@ -3,7 +3,7 @@ Viralix Backend — FastAPI
 Full pipeline: download → transcribe → AI analyze → FFmpeg cut → burn captions
 With production-grade authentication: password hashing, JWT, session management
 """
-import os, uuid, json, asyncio, shutil, subprocess, sys, textwrap
+import os, uuid, json, asyncio, shutil, subprocess, sys, textwrap, re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Annotated
@@ -18,22 +18,50 @@ from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 import uvicorn
 
-from backend.models import init_db, get_db, User
-from backend.auth import (
-    create_access_token, create_refresh_token, verify_token, 
-    verify_refresh_token_in_db, revoke_refresh_token,
-    register_user, authenticate_user, TokenResponse,
-    ACCESS_TOKEN_EXPIRE_MINUTES
-)
+try:
+    from backend.models import init_db, get_db, User
+    from backend.auth import (
+        create_access_token, create_refresh_token, verify_token,
+        verify_refresh_token_in_db, revoke_refresh_token,
+        register_user, authenticate_user, TokenResponse,
+        ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+except ModuleNotFoundError:
+    from models import init_db, get_db, User
+    from auth import (
+        create_access_token, create_refresh_token, verify_token,
+        verify_refresh_token_in_db, revoke_refresh_token,
+        register_user, authenticate_user, TokenResponse,
+        ACCESS_TOKEN_EXPIRE_MINUTES
+    )
 
 if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ── CONFIG — update FFMPEG path if yours is different ─────────────────────
-FFMPEG     = r"D:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
-UPLOAD_DIR = Path("uploads");  UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR = Path("outputs");  OUTPUT_DIR.mkdir(exist_ok=True)
-DB_FILE    = Path("jobs.json")
+# ── CONFIG — auto-detect binaries with env override support ───────────────
+def resolve_ffmpeg_binary() -> str:
+    env_ffmpeg = os.getenv("FFMPEG_PATH")
+    if env_ffmpeg and Path(env_ffmpeg).exists():
+        return env_ffmpeg
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    for candidate in [
+        r"D:\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ]:
+        if Path(candidate).exists():
+            return candidate
+    return "ffmpeg"
+
+
+FFMPEG = resolve_ffmpeg_binary()
+DATA_DIR = Path(os.getenv("VIRALIX_DATA_DIR", ".")).expanduser()
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "outputs"
+DB_FILE = DATA_DIR / "jobs.json"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Resolve yt-dlp path: prefer PATH, otherwise use venv\Scripts\yt-dlp.exe if present
 YTDLP = shutil.which("yt-dlp")
@@ -45,6 +73,50 @@ if not YTDLP:
 load_dotenv(Path(__file__).with_name(".env"))
 
 jobs: dict = {}
+
+GENRE_PROFILES = {
+    "motivation": {
+        "keywords": ["change", "discipline", "mindset", "win", "success", "focus", "consistency", "growth"],
+        "preferred_emotions": ["inspiring", "shocking"],
+    },
+    "podcast": {
+        "keywords": ["story", "lesson", "advice", "opinion", "guest", "experience", "truth", "insight"],
+        "preferred_emotions": ["relatable", "controversial"],
+    },
+    "healthcare": {
+        "keywords": ["health", "doctor", "patient", "symptom", "treatment", "sleep", "nutrition", "exercise"],
+        "preferred_emotions": ["inspiring", "relatable"],
+    },
+    "gaming": {
+        "keywords": ["game", "boss", "win", "clutch", "rank", "meta", "build", "strategy"],
+        "preferred_emotions": ["funny", "shocking"],
+    },
+    "business": {
+        "keywords": ["business", "sales", "client", "offer", "revenue", "profit", "market", "brand"],
+        "preferred_emotions": ["controversial", "inspiring"],
+    },
+    "education": {
+        "keywords": ["learn", "how", "explained", "example", "mistake", "method", "framework", "tips"],
+        "preferred_emotions": ["relatable", "inspiring"],
+    },
+    "general": {
+        "keywords": ["story", "why", "how", "truth", "secret", "mistake", "lesson", "result"],
+        "preferred_emotions": ["shocking", "relatable"],
+    },
+}
+
+HOOK_CUES = {
+    "you", "your", "nobody", "never", "always", "secret", "truth", "mistake", "today", "stop", "start",
+    "why", "how", "what", "biggest", "easy", "hard", "warning", "listen", "watch"
+}
+
+EMOTION_HINTS = {
+    "funny": {"funny", "laugh", "hilarious", "joke"},
+    "shocking": {"crazy", "shocking", "insane", "unbelievable", "wtf", "wild"},
+    "inspiring": {"inspire", "hope", "discipline", "growth", "dream", "believe"},
+    "relatable": {"same", "relate", "everyone", "daily", "struggle", "real"},
+    "controversial": {"controversial", "disagree", "debate", "hot", "take", "wrong"},
+}
 
 
 def job_dir(job_id: str) -> Path:
@@ -81,12 +153,19 @@ def normalize_clip_metadata(clip: dict) -> dict:
     return {
         **clip,
         "download_url": f"/outputs/{filename}" if filename else clip.get("download_url", ""),
+        "poster_url": clip.get("poster_url", ""),
     }
 
 
 def normalize_job(job: dict) -> dict:
+    genre = (job.get("genre") or "general").lower()
     return {
         **job,
+        "genre": genre,
+        "niche": job.get("niche", ""),
+        "audience": job.get("audience", ""),
+        "tone": job.get("tone", "balanced"),
+        "relevanceMode": job.get("relevanceMode", "balanced"),
         "clips": [normalize_clip_metadata(c) for c in job.get("clips", [])],
     }
 
@@ -118,6 +197,11 @@ app = FastAPI(title="Viralix API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 # Security
 security = HTTPBearer()
 
@@ -146,13 +230,15 @@ def update(job_id: str, **kwargs):
         jobs[job_id].update(kwargs)
         save_jobs()
 
-def make_job(job_id, title, language, clip_duration, auto_post, captions, user_id="guest"):
+def make_job(job_id, title, language, clip_duration, auto_post, captions, user_id="guest", genre="general", niche="", audience="", tone="balanced", relevance_mode="balanced"):
     return {
         "id": job_id, "title": title, "status": "queued",
         "progress": 0, "stage": "download", "log": [],
         "clips": [], "startedAt": datetime.utcnow().isoformat(),
         "language": language, "clipDuration": clip_duration,
         "autoPost": auto_post, "captions": captions, "userId": user_id,
+        "genre": (genre or "general").lower(), "niche": niche, "audience": audience,
+        "tone": tone, "relevanceMode": relevance_mode,
         "expiresAt": (datetime.utcnow() + timedelta(days=15)).isoformat(),
         "error": None,
     }
@@ -244,14 +330,38 @@ async def upload(
     clip_duration: int = Form(45),
     auto_post: bool = Form(False),
     captions: bool = Form(True),
+    genre: str = Form("general"),
+    niche: str = Form(""),
+    audience: str = Form(""),
+    tone: str = Form("balanced"),
+    relevance_mode: str = Form("balanced"),
     current_user: User = Depends(get_current_user),
 ):
     if not youtube_url and not video_file:
         raise HTTPException(400, "Provide a YouTube URL or upload an MP4")
 
+    genre = (genre or "general").strip().lower()
+    if genre not in GENRE_PROFILES:
+        genre = "general"
+    tone = (tone or "balanced").strip().lower()
+    relevance_mode = (relevance_mode or "balanced").strip().lower()
+
     job_id = str(uuid.uuid4())[:8]
     title  = "YouTube Video" if youtube_url else (video_file.filename or "Uploaded Video")
-    job    = make_job(job_id, title, language, clip_duration, auto_post, captions, current_user.id)
+    job    = make_job(
+        job_id,
+        title,
+        language,
+        clip_duration,
+        auto_post,
+        captions,
+        current_user.id,
+        genre=genre,
+        niche=(niche or "").strip(),
+        audience=(audience or "").strip(),
+        tone=tone,
+        relevance_mode=relevance_mode,
+    )
     jobs[job_id] = job
     save_jobs()
 
@@ -261,7 +371,21 @@ async def upload(
         with open(video_path, "wb") as f:
             f.write(await video_file.read())
 
-    background_tasks.add_task(run_pipeline, job_id, youtube_url, video_path, language, clip_duration, auto_post, captions)
+    background_tasks.add_task(
+        run_pipeline,
+        job_id,
+        youtube_url,
+        video_path,
+        language,
+        clip_duration,
+        auto_post,
+        captions,
+        genre,
+        (niche or "").strip(),
+        (audience or "").strip(),
+        tone,
+        relevance_mode,
+    )
     return job
 
 @app.get("/status/{job_id}")
@@ -384,12 +508,12 @@ async def regenerate_clip(job_id: str, rank: int, current_user: User = Depends(g
     return new_clip
 
 # ── Pipeline ──────────────────────────────────────────────────────────────
-async def run_pipeline(job_id, youtube_url, video_path, language, clip_duration, auto_post, captions):
+async def run_pipeline(job_id, youtube_url, video_path, language, clip_duration, auto_post, captions, genre, niche, audience, tone, relevance_mode):
     try:
         update(job_id, status="processing", stage="download", progress=5)
         log(job_id, "Starting download...")
         if youtube_url:
-            video_path = await download_youtube(job_id, youtube_url)
+            video_path = await download_media(job_id, youtube_url)
         elif video_path:
             final_source = source_file(job_id)
             if str(Path(video_path)) != str(final_source):
@@ -407,8 +531,8 @@ async def run_pipeline(job_id, youtube_url, video_path, language, clip_duration,
         log(job_id, f"Transcript ready — {len(transcript.get('segments', []))} segments")
 
         update(job_id, stage="analyze", progress=50)
-        log(job_id, "Claude analyzing viral moments...")
-        moments = await find_viral_moments(job_id, transcript, clip_duration)
+        log(job_id, f"Analyzing viral moments for genre={genre} tone={tone} relevance={relevance_mode}...")
+        moments = await find_viral_moments(job_id, transcript, clip_duration, genre, niche, audience, tone, relevance_mode)
         log(job_id, f"Found {len(moments)} viral moments")
 
         update(job_id, stage="generate", progress=70)
@@ -425,8 +549,46 @@ async def run_pipeline(job_id, youtube_url, video_path, language, clip_duration,
         update(job_id, status="error", error=str(e))
         log(job_id, f"ERROR: {str(e)}")
 
-# ── Download YouTube ──────────────────────────────────────────────────────
-async def download_youtube(job_id: str, url: str) -> str:
+# ── Download Media ────────────────────────────────────────────────────────
+async def download_direct_media(job_id: str, url: str) -> str | None:
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, allow_redirects=True, timeout=20) as head_resp:
+                content_type = (head_resp.headers.get("content-type") or "").lower()
+
+            if "video" not in content_type and not any(url.lower().split("?")[0].endswith(ext) for ext in [".mp4", ".mov", ".mkv", ".webm", ".m4v"]):
+                return None
+
+            async with session.get(url, allow_redirects=True, timeout=None) as resp:
+                if resp.status >= 400:
+                    return None
+                content_type = (resp.headers.get("content-type") or content_type).lower()
+                ext = ".mp4"
+                if "webm" in content_type:
+                    ext = ".webm"
+                elif "quicktime" in content_type or ".mov" in url.lower():
+                    ext = ".mov"
+                elif "x-matroska" in content_type or ".mkv" in url.lower():
+                    ext = ".mkv"
+
+                out_path = source_file(job_id).with_suffix(ext)
+                with open(out_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                return str(out_path)
+    except Exception as e:
+        log(job_id, f"Direct media download failed ({e})")
+        return None
+
+
+async def download_media(job_id: str, url: str) -> str:
+    direct = await download_direct_media(job_id, url)
+    if direct and Path(direct).exists():
+        return direct
+
     out = str(job_dir(job_id) / "source.%(ext)s")
     if not YTDLP:
         raise RuntimeError("yt-dlp not found. Install yt-dlp in the project's venv or add it to PATH.")
@@ -436,6 +598,9 @@ async def download_youtube(job_id: str, url: str) -> str:
     if proc.returncode != 0:
         err = proc.stderr or ""
         print(f"YT-DLP ERROR: {err}")
+        direct = await download_direct_media(job_id, url)
+        if direct and Path(direct).exists():
+            return direct
         raise RuntimeError(f"Download failed: {err[-300:]}")
     for f in job_dir(job_id).glob("source.*"):
         return str(f)
@@ -512,46 +677,338 @@ async def transcribe_openai(job_id: str, audio_path: str) -> dict:
     }
 
 async def transcribe_local(job_id: str, audio_path: str) -> dict:
-    import whisper
-    log(job_id, "Loading local Whisper model (first time is slow)...")
-    model = whisper.load_model("base")
-    result = model.transcribe(audio_path, word_timestamps=True)
-    return {"text": result["text"], "segments": result["segments"], "language": result["language"]}
+    # Local transcription with improved preprocessing and optional faster-whisper model.
+    # Falls back to OpenAI/whisper if faster-whisper is not installed.
+    try:
+        from faster_whisper import WhisperModel
+        fw_available = True
+    except Exception:
+        fw_available = False
+
+    async def _preprocess(in_path: str) -> str:
+        """Normalize audio for transcription: resample to 16k mono, apply highpass/lowpass and dynamic normalization."""
+        out = Path(str(in_path)).with_suffix(".preproc.wav")
+        if out.exists():
+            return str(out)
+        cmd = [
+            FFMPEG, "-y", "-i", str(in_path),
+            "-af",
+            "highpass=f=200, lowpass=f=8000, aresample=16000, dynaudnorm=f=150",
+            "-ac", "1", "-ar", "16000", str(out)
+        ]
+        proc = await run_subprocess(cmd)
+        if proc.returncode != 0:
+            log(job_id, f"Audio preprocess failed, using original: {proc.stderr[:200]}")
+            return str(in_path)
+        return str(out)
+
+    # Preprocess audio first
+    preproc = await _preprocess(audio_path)
+
+    # Try faster-whisper medium model for better quality/speed tradeoff
+    if fw_available:
+        try:
+            log(job_id, "Using faster-whisper (medium) for local transcription")
+            model = WhisperModel("medium", device="cpu")
+            segments = []
+            # beam_size improves accuracy at cost of some speed; vad_filter reduces hallucinations
+            for segment in model.transcribe(preproc, beam_size=5, word_timestamps=True, vad_filter=True):
+                # segment has start, end, text, and words if available
+                seg = {"start": float(segment.start), "end": float(segment.end), "text": segment.text}
+                # attach word timestamps if present
+                try:
+                    seg_words = []
+                    for w in getattr(segment, "words", []) or []:
+                        seg_words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
+                    if seg_words:
+                        seg["words"] = seg_words
+                except Exception:
+                    pass
+                segments.append(seg)
+            full_text = " ".join(s["text"] for s in segments).strip()
+            # Post-process: merge small/adjacent segments to reduce fragmentation
+            segments = post_process_segments(segments)
+            return {"text": full_text, "segments": segments, "language": "en"}
+        except Exception as e:
+            log(job_id, f"faster-whisper failed ({e}) — falling back to whisper")
+
+    # Fallback: use OpenAI Whisper (pyannote/whisper) model if available
+    try:
+        import whisper
+        log(job_id, "Loading local Whisper model (base) — may be slower/lower quality)")
+        model = whisper.load_model("base")
+        # prefer preprocessed audio if available
+        result = model.transcribe(preproc or audio_path, word_timestamps=True)
+        segs = []
+        for s in result.get("segments", []):
+            segs.append({"start": s["start"], "end": s["end"], "text": s["text"],
+                         "words": s.get("words", [])})
+        segs = post_process_segments(segs)
+        return {"text": result.get("text", ""), "segments": segs, "language": result.get("language", "en")}
+    except Exception as e:
+        log(job_id, f"Local transcription failed: {e}")
+        raise
+
+
+def post_process_segments(segments: list[dict]) -> list[dict]:
+    """Merge short/adjacent segments and clean punctuation to reduce fragmentation and hallucinations.
+
+    Rules:
+    - Merge segments when gap <= 0.3s
+    - Merge if combined length < 120 chars to avoid excessively long segments
+    - Strip leading/trailing whitespace and normalize internal spaces
+    - Light punctuation cleanup: collapse repeated punctuation and ensure spacing
+    """
+    if not segments:
+        return segments
+    out = []
+    cur = segments[0].copy()
+    cur["text"] = " ".join(cur.get("text","").split())
+    for seg in segments[1:]:
+        seg_text = " ".join(seg.get("text","").split())
+        gap = seg.get("start", 0) - cur.get("end", 0)
+        combined = (cur.get("text","") + " " + seg_text).strip()
+        if gap <= 0.3 and len(combined) <= 120:
+            # merge
+            cur["end"] = seg.get("end", cur["end"])
+            cur["text"] = combined
+            # merge words if present
+            if "words" in cur or "words" in seg:
+                cur_words = cur.get("words", []) + seg.get("words", [])
+                cur["words"] = cur_words
+        else:
+            # finalize current
+            cur["text"] = clean_punctuation(cur.get("text",""))
+            out.append(cur)
+            cur = seg.copy()
+            cur["text"] = seg_text
+    cur["text"] = clean_punctuation(cur.get("text",""))
+    out.append(cur)
+    return out
+
+
+def clean_punctuation(text: str) -> str:
+    """Simple punctuation normalization: collapse multiple punctuation, trim spaces, capitalize sentence starts."""
+    import re
+    if not text:
+        return text
+    # collapse repeated punctuation
+    text = re.sub(r"[\?\!]{2,}", lambda m: m.group(0)[0], text)
+    text = re.sub(r"\.\.+", "…", text)
+    # normalize spaces around punctuation
+    text = re.sub(r"\s+([\.,!?…])", r"\1", text)
+    text = re.sub(r"([\.,!?…])([^\s])", r"\1 \2", text)
+    text = " ".join(text.split())
+    # capitalize after sentence boundaries
+    parts = [p.strip().capitalize() for p in re.split(r'([\.!?…]\s+)', text)]
+    # recombine keeping punctuation separators
+    if len(parts) > 1:
+        text = "".join(parts)
+    else:
+        text = parts[0]
+    return text
 
 # ── AI Viral Detection ────────────────────────────────────────────────────
-async def find_viral_moments(job_id: str, transcript: dict, clip_duration: int) -> list:
+def tokenize_text(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-zA-Z']+", (text or "").lower()) if t]
+
+
+def infer_emotion(text: str, preferred: list[str]) -> str:
+    tokens = set(tokenize_text(text))
+    scored = []
+    for emotion, hints in EMOTION_HINTS.items():
+        score = len(tokens.intersection(hints))
+        if emotion in preferred:
+            score += 1
+        scored.append((score, emotion))
+    scored.sort(reverse=True)
+    return scored[0][1] if scored and scored[0][0] > 0 else (preferred[0] if preferred else "relatable")
+
+
+def build_fallback_moments(transcript: dict, clip_duration: int, genre: str, niche: str, audience: str, relevance_mode: str) -> list[dict]:
+    segs = transcript.get("segments", [])
+    if not segs:
+        return [{
+            "rank": 1,
+            "start": 0.0,
+            "end": float(max(8, min(clip_duration, 30))),
+            "title": f"{genre.title()} Highlight",
+            "hook_line": f"Quick {genre} highlight tailored for short-form viewers.",
+            "why_viral": "Fallback highlight generated because transcript segments were empty.",
+            "score": 7.4,
+            "emotion": GENRE_PROFILES.get(genre, GENRE_PROFILES["general"])["preferred_emotions"][0],
+        }]
+
+    profile = GENRE_PROFILES.get(genre, GENRE_PROFILES["general"])
+    extra_keywords = tokenize_text(f"{niche} {audience}")
+    keywords = set(profile["keywords"] + extra_keywords)
+    strictness = {"discovery": 0.8, "balanced": 1.0, "precision": 1.3}.get(relevance_mode, 1.0)
+
+    candidates = []
+    for i, seg in enumerate(segs):
+        start = float(seg.get("start", 0.0))
+        end = max(start + 1.0, start + float(clip_duration))
+
+        chunk_parts = []
+        j = i
+        while j < len(segs) and float(segs[j].get("start", 0.0)) < end:
+            chunk_parts.append((segs[j].get("text") or "").strip())
+            end = max(end, float(segs[j].get("end", end)))
+            if end - start >= clip_duration:
+                break
+            j += 1
+
+        chunk_text = " ".join(p for p in chunk_parts if p).strip()
+        if len(chunk_text) < 30:
+            continue
+
+        tokens = tokenize_text(chunk_text)
+        token_set = set(tokens)
+        keyword_hits = len(token_set.intersection(keywords))
+        hook_hits = len(token_set.intersection(HOOK_CUES))
+        short_sentence_bonus = 1 if len(tokens) <= 90 else 0
+        relevance_score = (keyword_hits * 1.25 + hook_hits * 0.95 + short_sentence_bonus) * strictness
+
+        candidates.append({
+            "start": start,
+            "end": min(end, start + clip_duration + 8),
+            "text": chunk_text,
+            "score": relevance_score,
+            "keyword_hits": keyword_hits,
+            "hook_hits": hook_hits,
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    top = []
+    for cand in candidates:
+        overlaps = False
+        for kept in top:
+            if not (cand["end"] <= kept["start"] or cand["start"] >= kept["end"]):
+                overlaps = True
+                break
+        if overlaps:
+            continue
+        top.append(cand)
+        if len(top) >= 5:
+            break
+
+    moments = []
+    preferred = profile["preferred_emotions"]
+    for idx, cand in enumerate(top, 1):
+        text = cand["text"]
+        title_words = text.split()[:7]
+        title = " ".join(title_words).strip(".,!?;:-") or f"{genre.title()} Viral Moment {idx}"
+        hook_line = text.split(".")[0][:120].strip()
+        why = f"High {genre} relevance with {cand['keyword_hits']} keyword hits and a strong hook opening."
+        score = max(6.8, min(9.8, 6.9 + cand["score"] * 0.35 - (idx - 1) * 0.2))
+        moments.append({
+            "rank": idx,
+            "start": round(cand["start"], 2),
+            "end": round(cand["end"], 2),
+            "title": title,
+            "hook_line": hook_line,
+            "why_viral": why,
+            "score": round(score, 1),
+            "emotion": infer_emotion(text, preferred),
+        })
+
+    if moments:
+        return moments
+
+    # Safety fallback for very sparse transcripts.
+    first = segs[:5]
+    return [
+        {
+            "rank": i + 1,
+            "start": float(s.get("start", 0.0)),
+            "end": min(float(s.get("start", 0.0)) + clip_duration, float(s.get("end", 0.0)) + 12),
+            "title": f"{genre.title()} Moment {i + 1}",
+            "hook_line": (s.get("text") or "")[:110],
+            "why_viral": f"Potentially strong {genre} clip based on timing and context.",
+            "score": round(8.2 - i * 0.25, 1),
+            "emotion": profile["preferred_emotions"][i % len(profile["preferred_emotions"])],
+        }
+        for i, s in enumerate(first)
+    ]
+
+
+def sanitize_moments(moments: list[dict], clip_duration: int, profile: dict, genre: str) -> list[dict]:
+    cleaned = []
+    for i, m in enumerate(moments[:5], 1):
+        start = max(0.0, float(m.get("start", 0.0)))
+        end = max(start + 1.0, float(m.get("end", start + clip_duration)))
+        end = min(end, start + clip_duration + 10)
+        emotion = str(m.get("emotion") or "").lower()
+        if emotion not in {"funny", "shocking", "inspiring", "relatable", "controversial"}:
+            emotion = profile["preferred_emotions"][0]
+        cleaned.append({
+            "rank": i,
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "title": str(m.get("title") or f"{genre.title()} Viral Moment {i}")[:90],
+            "hook_line": str(m.get("hook_line") or m.get("hook") or "")[:180],
+            "why_viral": str(m.get("why_viral") or f"Strong {genre} relevance and retention potential.")[:260],
+            "score": round(max(6.0, min(10.0, float(m.get("score", 8.0)))), 1),
+            "emotion": emotion,
+        })
+    return cleaned
+
+
+async def find_viral_moments(job_id: str, transcript: dict, clip_duration: int, genre: str, niche: str, audience: str, tone: str, relevance_mode: str) -> list:
+    profile = GENRE_PROFILES.get(genre, GENRE_PROFILES["general"])
+    segs = transcript.get("segments", [])
+    lines = [f"[{s['start']:.1f}s-{s['end']:.1f}s]: {s.get('text', '')}" for s in segs]
+    timed = "\n".join(lines[:200])
+
     try:
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY missing")
+
         import anthropic
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        segs = transcript.get("segments", [])
-        lines = [f"[{s['start']:.1f}s–{s['end']:.1f}s]: {s['text']}" for s in segs]
-        timed = "\n".join(lines[:150])
 
-        prompt = f"""You are a viral short-form video expert. Analyze this transcript and find top 5 viral moments for {clip_duration}-second clips.
+        prompt = f"""You are a short-form growth strategist for {genre} content.
+
+Inputs:
+- Genre: {genre}
+- Niche: {niche or 'general'}
+- Audience: {audience or 'broad'}
+- Tone: {tone}
+- Relevance mode: {relevance_mode}
+- Target clip length: {clip_duration} seconds
+- Genre keywords to prioritize: {', '.join(profile['keywords'])}
 
 TRANSCRIPT:
 {timed}
 
-Find segments with: strong hook in first 3s, high emotion, complete as standalone, length {max(15,clip_duration-10)}–{clip_duration}s.
+Task:
+- Return exactly 5 clips.
+- Prioritize semantic relevance to the genre and niche.
+- Each clip should feel standalone and start with a strong first 1-3 seconds.
+- Prefer clips in the {max(15, clip_duration - 10)}-{clip_duration + 6}s range.
+- Keep title <= 7 words.
+- hook_line should be the most attention-grabbing first sentence.
 
-Respond ONLY with valid JSON, no markdown:
-{{"moments":[{{"rank":1,"start":12.5,"end":58.0,"title":"Short title max 6 words","hook_line":"Opening hook line","why_viral":"Why this goes viral","score":9.2,"emotion":"shocking"}}]}}
+Respond with ONLY valid JSON:
+{{"moments":[{{"rank":1,"start":12.5,"end":58.0,"title":"...","hook_line":"...","why_viral":"...","score":9.1,"emotion":"shocking"}}]}}
 
 Valid emotions: funny, shocking, inspiring, relatable, controversial"""
 
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1500,
-            messages=[{"role":"user","content":prompt}])
+            model="claude-sonnet-4-20250514",
+            max_tokens=1600,
+            messages=[{"role": "user", "content": prompt}],
+        )
         raw = msg.content[0].text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        return json.loads(raw)["moments"]
+        ai_moments = json.loads(raw).get("moments", [])
+        cleaned = sanitize_moments(ai_moments, clip_duration, profile, genre)
+        if cleaned:
+            return cleaned
+        raise RuntimeError("AI returned no valid moments")
 
     except Exception as e:
-        log(job_id, f"AI error: {e} — using fallback segments")
-        segs = transcript.get("segments", [])
-        return [{"rank":i+1,"start":s["start"],"end":min(s["start"]+clip_duration,s["end"]+30),
-             "title":f"Viral Moment {i+1}","hook_line":s["text"][:80],"why_viral":"High engagement segment",
-             "score":round(8.5-i*0.3,1),"emotion":["shocking","inspiring","relatable","funny","controversial"][i%5]}
-            for i, s in enumerate(segs[:5])]
+        log(job_id, f"AI error: {e} — using relevance fallback")
+        return build_fallback_moments(transcript, clip_duration, genre, niche, audience, relevance_mode)
 
 # ── Translation ───────────────────────────────────────────────────────────
 async def translate_text(text: str, target_lang: str) -> str:
@@ -621,23 +1078,31 @@ async def render_clip(job_id: str, video_path: str, moment: dict, transcript: di
 
     if captions:
         cap_segs = get_caption_segments(transcript, start, end)
-        srt_path = out_dir / f"clip_{moment['rank']}.srt"
-        write_srt(cap_segs, srt_path)
-        srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-        vf_caption = f"subtitles='{srt_escaped}':force_style='{build_caption_force_style(cap_segs)}'"
+        if cap_segs:
+            srt_path = out_dir / f"clip_{moment['rank']}.srt"
+            write_srt(cap_segs, srt_path)
+            srt_abs = srt_path.resolve()
+            srt_escaped = str(srt_abs).replace("\\", "/").replace(":", "\\:")
+            vf_caption = f"subtitles='{srt_escaped}':force_style='{build_caption_force_style(cap_segs)}'"
 
-        cmd2 = [FFMPEG, "-y", "-i", str(tmp), "-vf", vf_caption,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-c:a", "copy", "-movflags", "+faststart", str(path)]
-        proc2 = await run_subprocess(cmd2)
+            cmd2 = [FFMPEG, "-y", "-i", str(tmp), "-vf", vf_caption,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "copy", "-movflags", "+faststart", str(path)]
+            proc2 = await run_subprocess(cmd2)
 
-        if proc2.returncode != 0:
-            err = proc2.stderr or ""
-            print(f"FFMPEG CAPTION ERROR clip {moment['rank']}:\n{err[-300:]}")
-            log(job_id, f"Caption burn failed — using clean cut for clip {moment['rank']}")
-            if tmp.exists(): shutil.copy(str(tmp), str(path))
-        try: srt_path.unlink()
-        except: pass
+            if proc2.returncode != 0:
+                err = proc2.stderr or ""
+                print(f"FFMPEG CAPTION ERROR clip {moment['rank']}:\n{err[-300:]}")
+                log(job_id, f"Caption burn failed — using clean cut for clip {moment['rank']}")
+                if tmp.exists(): shutil.copy(str(tmp), str(path))
+            try:
+                srt_path.unlink()
+            except:
+                pass
+        else:
+            if tmp.exists():
+                shutil.copy(str(tmp), str(path))
+            log(job_id, f"No transcript segments for captions — exported clean clip {moment['rank']}")
     else:
         if tmp.exists(): shutil.copy(str(tmp), str(path))
         log(job_id, f"Captions disabled — exported clean clip {moment['rank']}")
@@ -647,6 +1112,24 @@ async def render_clip(job_id: str, video_path: str, moment: dict, transcript: di
 
     if not path.exists():
         return None
+
+    poster_name = f"poster_{moment['rank']}.jpg"
+    poster_path = out_dir / poster_name
+    try:
+        poster_cmd = [
+            FFMPEG, "-y",
+            "-ss", "0.8",
+            "-i", str(path),
+            "-vframes", "1",
+            "-vf", "scale=540:960:force_original_aspect_ratio=increase,crop=540:960",
+            "-q:v", "2",
+            str(poster_path),
+        ]
+        poster_proc = await run_subprocess(poster_cmd)
+        if poster_proc.returncode != 0 or not poster_path.exists():
+            poster_path = None
+    except Exception:
+        poster_path = None
 
     size_mb = round(path.stat().st_size / 1024 / 1024, 1)
     clip = {
@@ -665,6 +1148,7 @@ async def render_clip(job_id: str, video_path: str, moment: dict, transcript: di
         "language": language,
         "download_url": f"/outputs/{job_id}/{name}",
         "captions": captions,
+        "poster_url": f"/outputs/{job_id}/{poster_name}" if poster_path and poster_path.exists() else "",
     }
     log(job_id, f"Clip {moment['rank']} ready ({size_mb} MB)")
     return clip
