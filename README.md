@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🎬 Viralix
 
 > AI-powered short-form video clipping platform that transforms long-form videos into engaging, captioned vertical clips for social media.
@@ -153,11 +154,119 @@ docker build -f backend/Dockerfile -t viralix .
 ```
 
 Run:
+=======
+# Viralix
+
+Automated short-form video clip generation for creators, editors, and social teams. Viralix ingests a source video or YouTube URL, transcribes the audio, finds high-retention moments, cuts vertical clips, burns captions, and serves downloadable outputs through a web app.
+
+## Features
+
+- YouTube URL and MP4 upload support
+- JWT-based authentication with refresh tokens
+- Transcript generation with local Whisper or optional AI providers
+- Viral-moment detection using heuristics or Anthropic when configured
+- FFmpeg-powered vertical clip generation
+- Caption burning with two-line subtitle safety constraints
+- Job history, clip preview, and downloadable outputs
+- Dockerized backend and automated GitHub Actions workflows
+
+## Architecture Overview
+
+Viralix follows a simple monorepo architecture:
+
+1. The React frontend submits an upload or URL.
+2. The FastAPI backend accepts the job, stores metadata, and starts the pipeline.
+3. FFmpeg extracts audio, trims clips, and burns captions.
+4. The transcript and generated clips are stored on disk.
+5. The frontend polls for status and renders job progress and results.
+
+```mermaid
+flowchart LR
+  A[Frontend SPA] --> B[FastAPI Backend]
+  B --> C[Audio Extraction]
+  C --> D[Transcription]
+  D --> E[Viral Moment Analysis]
+  E --> F[FFmpeg Clip Rendering]
+  F --> G[Local Storage / Persistent Disk]
+  G --> A
+```
+
+## Tech Stack
+
+### Frontend
+- React 19.2.5
+- TypeScript
+- React Router DOM 7.14.1
+- Axios, Framer Motion, React Hot Toast, React Dropzone
+- Create React App build tooling
+
+### Backend
+- Python 3.11
+- FastAPI
+- Uvicorn
+- SQLAlchemy
+- Pydantic
+- Passlib
+- python-jose
+- yt-dlp
+- FFmpeg
+
+### Optional AI / Transcription Providers
+- Anthropic
+- OpenAI
+- AssemblyAI
+
+## Installation Instructions
+
+### Prerequisites
+- Python 3.11+
+- Node.js 18+
+- FFmpeg installed and available on PATH, or set `FFMPEG_PATH`
+
+### Backend
+
+```bash
+cd backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm ci
+```
+
+## Local Development Setup
+
+### Run the backend
+
+```bash
+cd backend
+uvicorn server:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Run the frontend
+
+```bash
+cd frontend
+npm start
+```
+
+By default, the frontend targets `http://localhost:8000`. To point it at another backend, set `REACT_APP_API_URL` before building or starting the frontend.
+
+## Docker Usage
+
+### Build and run with Docker Compose
+>>>>>>> 55eabb9 (Polish repository for public portfolio)
 
 ```bash
 docker compose up --build
 ```
 
+<<<<<<< HEAD
 ---
 
 # ⚙️ Environment Variables
@@ -352,3 +461,83 @@ This project was built as a production-oriented AI video processing platform sho
 * Media processing pipelines
 
 If you found this project interesting, consider giving it a ⭐ on GitHub.
+=======
+The backend container listens on `PORT` when deployed on Render and defaults to `8000` locally.
+
+## Deployment Options
+
+- **Render:** Recommended for the backend. Use `render.yaml` for the backend Docker service and the static frontend site.
+- **GitHub Pages:** Suitable for the frontend only if you keep a static export approach.
+- **Fly.io:** Good alternative for the backend if you want an always-on container.
+- **Vercel / Netlify:** Good for the frontend, but less ideal for this backend pipeline.
+
+## Environment Variables
+
+Use placeholders only. Do not commit real secrets.
+
+### Backend
+
+- `JWT_SECRET_KEY` - JWT signing secret
+- `FFMPEG_PATH` - Optional FFmpeg binary override
+- `VIRALIX_DATA_DIR` - Base directory for uploads, outputs, and jobs metadata
+- `ANTHROPIC_API_KEY` - Optional Anthropic access key
+- `OPENAI_API_KEY` - Optional OpenAI access key
+- `ASSEMBLYAI_API_KEY` - Optional AssemblyAI access key
+
+### Frontend
+
+- `REACT_APP_API_URL` - Backend base URL used by the frontend
+
+### Render / CI
+
+- `RENDER_API_KEY` - Render API token for workflow-triggered deploys
+- `RENDER_SERVICE_ID` - Render service identifier for deploy triggers
+
+## Screenshots
+
+Add your project screenshots here after deployment.
+
+![Homepage placeholder](docs/screenshots/homepage-placeholder.png)
+![Processing placeholder](docs/screenshots/processing-placeholder.png)
+![Results placeholder](docs/screenshots/results-placeholder.png)
+
+## API Overview
+
+### Authentication
+- `POST /auth/signup`
+- `POST /auth/login`
+- `POST /auth/logout`
+- `POST /auth/refresh`
+- `GET /auth/me`
+
+### Jobs and clips
+- `POST /upload`
+- `GET /status/{job_id}`
+- `GET /jobs/{job_id}`
+- `GET /clips/{job_id}`
+- `GET /history`
+- `GET /download/{job_id}/{filename}`
+- `PATCH /jobs/{job_id}/clips/{rank}`
+- `DELETE /jobs/{job_id}/clips/{rank}`
+- `POST /jobs/{job_id}/clips/{rank}/regenerate`
+
+### Health
+- `GET /health`
+
+## Future Improvements
+
+- Move SQLite job persistence to managed Postgres
+- Add object storage for generated clips and uploads
+- Add a background worker queue for heavy processing
+- Add silent-video handling instead of failing at audio extraction
+- Add observability and structured logging
+- Add user-facing caption editing and preview tools
+
+## License
+
+This repository currently does not include a formal license file. Add one before distributing the project publicly. If you want a simple open-source default, MIT is a common choice.
+
+## Author
+
+Maintained by [udishgt](https://github.com/udishgt).
+>>>>>>> 55eabb9 (Polish repository for public portfolio)
